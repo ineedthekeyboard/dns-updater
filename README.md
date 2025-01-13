@@ -22,7 +22,6 @@ This project is a simple DNS updater that updates a DNS record with your current
     ```env
     DO_API_TOKEN=your_digitalocean_api_token
     DO_DOMAIN=your_domain.com
-    DO_RECORD_ID=your_dns_record_id
     ```
 
 ## Building the Project
