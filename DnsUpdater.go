@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -43,82 +44,82 @@ func getSubdomain(domain string) string {
 func getRecordID(config Config) (string, error) {
 	parentDomain := getParentDomain(config.Domain)
 	subdomain := getSubdomain(config.Domain)
-	
+
 	log.Printf("Looking for subdomain '%s' in parent domain '%s'", subdomain, parentDomain)
-	
+
 	baseURL := fmt.Sprintf("https://api.digitalocean.com/v2/domains/%s/records", parentDomain)
 	currentURL := baseURL
-	
+
 	var allRecords []DNSRecord
-	
+
 	for currentURL != "" {
-			log.Printf("Fetching DNS records from: %s", currentURL)
-			
-			req, err := http.NewRequest("GET", currentURL, nil)
-			if err != nil {
-					return "", fmt.Errorf("failed to create request: %v", err)
-			}
+		log.Printf("Fetching DNS records from: %s", currentURL)
 
-			req.Header.Set("Authorization", "Bearer "+config.APIToken)
-			req.Header.Set("Content-Type", "application/json")
+		req, err := http.NewRequest("GET", currentURL, nil)
+		if err != nil {
+			return "", fmt.Errorf("failed to create request: %v", err)
+		}
 
-			client := &http.Client{}
-			resp, err := client.Do(req)
-			if err != nil {
-					return "", fmt.Errorf("failed to send request: %v", err)
-			}
-			defer resp.Body.Close()
+		req.Header.Set("Authorization", "Bearer "+config.APIToken)
+		req.Header.Set("Content-Type", "application/json")
 
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-					return "", fmt.Errorf("failed to read response body: %v", err)
-			}
-			
-			if resp.StatusCode != http.StatusOK {
-					log.Printf("Request failed. Domain: %s, Status: %d, Response: %s", parentDomain, resp.StatusCode, string(body))
-					return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
-			}
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("failed to send request: %v", err)
+		}
+		defer resp.Body.Close()
 
-			// Define structures to match the exact JSON response
-			type PageResponse struct {
-					DomainRecords []DNSRecord `json:"domain_records"`
-					Links struct {
-							Pages struct {
-									Last string `json:"last"`
-									Next string `json:"next"`
-							} `json:"pages"`
-					} `json:"links"`
-					Meta struct {
-							Total int `json:"total"`
-					} `json:"meta"`
-			}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", fmt.Errorf("failed to read response body: %v", err)
+		}
 
-			var pageResponse PageResponse
-			if err := json.Unmarshal(body, &pageResponse); err != nil {
-					return "", fmt.Errorf("failed to parse response: %v", err)
-			}
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("Request failed. Domain: %s, Status: %d, Response: %s", parentDomain, resp.StatusCode, string(body))
+			return "", fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, string(body))
+		}
 
-			log.Printf("Fetched page with %d records", len(pageResponse.DomainRecords))
-			
-			// Append the records from this page
-			allRecords = append(allRecords, pageResponse.DomainRecords...)
-			
-			// Update URL for next page or exit if no more pages
-			currentURL = pageResponse.Links.Pages.Next
-			if currentURL == "" {
-					log.Printf("No more pages to fetch")
-			}
+		// Define structures to match the exact JSON response
+		type PageResponse struct {
+			DomainRecords []DNSRecord `json:"domain_records"`
+			Links         struct {
+				Pages struct {
+					Last string `json:"last"`
+					Next string `json:"next"`
+				} `json:"pages"`
+			} `json:"links"`
+			Meta struct {
+				Total int `json:"total"`
+			} `json:"meta"`
+		}
+
+		var pageResponse PageResponse
+		if err := json.Unmarshal(body, &pageResponse); err != nil {
+			return "", fmt.Errorf("failed to parse response: %v", err)
+		}
+
+		log.Printf("Fetched page with %d records", len(pageResponse.DomainRecords))
+
+		// Append the records from this page
+		allRecords = append(allRecords, pageResponse.DomainRecords...)
+
+		// Update URL for next page or exit if no more pages
+		currentURL = pageResponse.Links.Pages.Next
+		if currentURL == "" {
+			log.Printf("No more pages to fetch")
+		}
 	}
 
 	log.Printf("Total records fetched: %d", len(allRecords))
 
 	// Look for the A record matching the subdomain
 	for _, record := range allRecords {
-			// log.Printf("Checking record - Type: %s, Name: %s", record.Type, record.Name)
-			if record.Type == "A" && record.Name == subdomain {
-					log.Printf("Found matching record ID: %d", record.ID)
-					return fmt.Sprintf("%d", record.ID), nil
-			}
+		// log.Printf("Checking record - Type: %s, Name: %s", record.Type, record.Name)
+		if record.Type == "A" && record.Name == subdomain {
+			log.Printf("Found matching record ID: %d", record.ID)
+			return fmt.Sprintf("%d", record.ID), nil
+		}
 	}
 
 	return "", fmt.Errorf("no matching A record found for subdomain %s in domain %s", subdomain, parentDomain)
@@ -163,9 +164,10 @@ func updateDNS(config Config, ip string) error {
 }
 
 type Config struct {
-	APIToken string
-	Domain   string
-	RecordID string
+	APIToken      string
+	Domain        string
+	RecordID      string
+	UpdateMinutes int
 }
 
 func loadEnvFile(filename string) (Config, error) {
@@ -174,7 +176,10 @@ func loadEnvFile(filename string) (Config, error) {
 		return Config{}, fmt.Errorf("error reading .env file: %v", err)
 	}
 
-	config := Config{}
+	config := Config{
+		UpdateMinutes: 5, // Default to 5 minutes if not specified
+	}
+
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -196,6 +201,10 @@ func loadEnvFile(filename string) (Config, error) {
 			config.APIToken = value
 		case "DO_DOMAIN":
 			config.Domain = value
+		case "UPDATE_MINUTES":
+			if minutes, err := strconv.Atoi(value); err == nil {
+				config.UpdateMinutes = minutes
+			}
 		}
 	}
 
@@ -235,12 +244,13 @@ func main() {
 	config.RecordID = recordID
 
 	log.Printf("Starting DNS updater for domain: %s with record ID: %s", config.Domain, config.RecordID)
+	log.Printf("Update interval: %d minutes", config.UpdateMinutes)
 
 	for {
 		ip, err := getCurrentIP()
 		if err != nil {
 			log.Printf("Error getting current IP: %v", err)
-			time.Sleep(5 * time.Minute)
+			time.Sleep(time.Duration(config.UpdateMinutes) * time.Minute)
 			continue
 		}
 
@@ -251,6 +261,6 @@ func main() {
 			log.Printf("Successfully updated DNS record for %s to IP %s", config.Domain, ip)
 		}
 
-		time.Sleep(5 * time.Minute)
+		time.Sleep(time.Duration(config.UpdateMinutes) * time.Minute)
 	}
 }
