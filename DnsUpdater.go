@@ -41,9 +41,9 @@ func getSubdomain(domain string) string {
 	return "@"
 }
 
-func getRecordID(config Config) (string, error) {
-	parentDomain := getParentDomain(config.Domain)
-	subdomain := getSubdomain(config.Domain)
+func getRecordID(apiToken string, domain string) (string, error) {
+	parentDomain := getParentDomain(domain)
+	subdomain := getSubdomain(domain)
 
 	log.Printf("Looking for subdomain '%s' in parent domain '%s'", subdomain, parentDomain)
 
@@ -60,7 +60,7 @@ func getRecordID(config Config) (string, error) {
 			return "", fmt.Errorf("failed to create request: %v", err)
 		}
 
-		req.Header.Set("Authorization", "Bearer "+config.APIToken)
+		req.Header.Set("Authorization", "Bearer "+apiToken)
 		req.Header.Set("Content-Type", "application/json")
 
 		client := &http.Client{}
@@ -125,11 +125,11 @@ func getRecordID(config Config) (string, error) {
 	return "", fmt.Errorf("no matching A record found for subdomain %s in domain %s", subdomain, parentDomain)
 }
 
-func updateDNS(config Config, ip string) error {
-	log.Printf("Updating DNS - Domain: %s, Record ID: %s, New IP: %s", config.Domain, config.RecordID, ip)
+func updateDNS(apiToken string, domainConfig DomainConfig, ip string) error {
+	log.Printf("Updating DNS - Domain: %s, Record ID: %s, New IP: %s", domainConfig.Domain, domainConfig.RecordID, ip)
 	record := DNSRecord{
 		Type: "A",
-		Name: getSubdomain(config.Domain),
+		Name: getSubdomain(domainConfig.Domain),
 		Data: ip,
 		TTL:  3600,
 	}
@@ -139,13 +139,13 @@ func updateDNS(config Config, ip string) error {
 		return err
 	}
 
-	url := fmt.Sprintf("https://api.digitalocean.com/v2/domains/%s/records/%s", getParentDomain(config.Domain), config.RecordID)
+	url := fmt.Sprintf("https://api.digitalocean.com/v2/domains/%s/records/%s", getParentDomain(domainConfig.Domain), domainConfig.RecordID)
 	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+config.APIToken)
+	req.Header.Set("Authorization", "Bearer "+apiToken)
 	req.Header.Set("Content-Type", "application/json")
 
 	client := &http.Client{}
@@ -163,10 +163,14 @@ func updateDNS(config Config, ip string) error {
 	return nil
 }
 
+type DomainConfig struct {
+	Domain   string
+	RecordID string
+}
+
 type Config struct {
 	APIToken      string
-	Domain        string
-	RecordID      string
+	Domains       []DomainConfig
 	UpdateMinutes int
 }
 
@@ -178,7 +182,10 @@ func loadEnvFile(filename string) (Config, error) {
 
 	config := Config{
 		UpdateMinutes: 5, // Default to 5 minutes if not specified
+		Domains:       []DomainConfig{},
 	}
+
+	var domainsStr string
 
 	lines := strings.Split(string(content), "\n")
 	for _, line := range lines {
@@ -199,8 +206,8 @@ func loadEnvFile(filename string) (Config, error) {
 		switch key {
 		case "DO_API_TOKEN":
 			config.APIToken = value
-		case "DO_DOMAIN":
-			config.Domain = value
+		case "DO_DOMAINS":
+			domainsStr = value
 		case "UPDATE_MINUTES":
 			if minutes, err := strconv.Atoi(value); err == nil {
 				config.UpdateMinutes = minutes
@@ -208,8 +215,24 @@ func loadEnvFile(filename string) (Config, error) {
 		}
 	}
 
-	if config.APIToken == "" || config.Domain == "" {
+	if config.APIToken == "" || domainsStr == "" {
 		return config, fmt.Errorf("missing required configuration in .env file")
+	}
+
+	// Parse comma-separated domains
+	domainList := strings.Split(domainsStr, ",")
+	for _, domain := range domainList {
+		domain = strings.TrimSpace(domain)
+		if domain != "" {
+			config.Domains = append(config.Domains, DomainConfig{
+				Domain:   domain,
+				RecordID: "",
+			})
+		}
+	}
+
+	if len(config.Domains) == 0 {
+		return config, fmt.Errorf("no domains specified in .env file")
 	}
 
 	return config, nil
@@ -236,14 +259,18 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Get the record ID for the domain
-	recordID, err := getRecordID(config)
-	if err != nil {
-		log.Fatalf("Failed to get record ID: %v", err)
+	// Get the record IDs for all domains
+	log.Printf("Fetching record IDs for %d domain(s)...", len(config.Domains))
+	for i := range config.Domains {
+		recordID, err := getRecordID(config.APIToken, config.Domains[i].Domain)
+		if err != nil {
+			log.Fatalf("Failed to get record ID for domain %s: %v", config.Domains[i].Domain, err)
+		}
+		config.Domains[i].RecordID = recordID
+		log.Printf("Domain: %s, Record ID: %s", config.Domains[i].Domain, config.Domains[i].RecordID)
 	}
-	config.RecordID = recordID
 
-	log.Printf("Starting DNS updater for domain: %s with record ID: %s", config.Domain, config.RecordID)
+	log.Printf("Starting DNS updater for %d domain(s)", len(config.Domains))
 	log.Printf("Update interval: %d minutes", config.UpdateMinutes)
 
 	for {
@@ -254,11 +281,16 @@ func main() {
 			continue
 		}
 
-		err = updateDNS(config, ip)
-		if err != nil {
-			log.Printf("Error updating DNS: %v", err)
-		} else {
-			log.Printf("Successfully updated DNS record for %s to IP %s", config.Domain, ip)
+		log.Printf("Current IP: %s", ip)
+
+		// Update all domains with the same IP
+		for _, domainConfig := range config.Domains {
+			err = updateDNS(config.APIToken, domainConfig, ip)
+			if err != nil {
+				log.Printf("Error updating DNS for %s: %v", domainConfig.Domain, err)
+			} else {
+				log.Printf("Successfully updated DNS record for %s to IP %s", domainConfig.Domain, ip)
+			}
 		}
 
 		time.Sleep(time.Duration(config.UpdateMinutes) * time.Minute)
